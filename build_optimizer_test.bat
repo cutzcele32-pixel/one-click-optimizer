@@ -5,4 +5,4 @@ cl /nologo /std:c++17 /W4 /permissive- /EHsc /O2 ^
    pcopt.cpp ^
    /link /OUT:"optimizer test.exe" /SUBSYSTEM:WINDOWS /MACHINE:X64 ^
         /MANIFESTUAC:level='requireAdministrator' ^
-   winhttp.lib iphlpapi.lib psapi.lib shell32.lib advapi32.lib user32.lib gdi32.lib winmm.lib
+   gdiplus.lib winhttp.lib iphlpapi.lib psapi.lib shell32.lib advapi32.lib user32.lib gdi32.lib winmm.lib
